@@ -1,0 +1,38 @@
+{
+  "name": "@ferdousbhai/stop-review",
+  "version": "0.1.0",
+  "description": "A portable Stop-hook reviewer for Codex, Claude Code, and Ghost.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Ferdous Bhai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ferdousbhai/stop-review.git"
+  },
+  "homepage": "https://github.com/ferdousbhai/stop-review#readme",
+  "bugs": "https://github.com/ferdousbhai/stop-review/issues",
+  "bin": {
+    "stop-review": "scripts/install.mjs"
+  },
+  "files": [
+    "plugins/stop-review",
+    "scripts/install.mjs",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run build && npm test",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

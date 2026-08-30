@@ -1,0 +1,24 @@
+{
+  "name": "stop-review",
+  "version": "0.1.0",
+  "description": "Review the last assistant message before a Codex turn stops.",
+  "author": {
+    "name": "Ferdous Bhai",
+    "url": "https://github.com/ferdousbhai"
+  },
+  "homepage": "https://github.com/ferdousbhai/stop-review",
+  "repository": "https://github.com/ferdousbhai/stop-review",
+  "license": "MIT",
+  "keywords": ["codex", "hooks", "stop", "continuity"],
+  "interface": {
+    "displayName": "Stop Review",
+    "shortDescription": "Continue incomplete Codex turns automatically.",
+    "longDescription": "Classifies the last assistant message as CONTINUE, CONSULT, or STOP, then emits the exact Codex Stop-hook response.",
+    "developerName": "Ferdous Bhai",
+    "category": "Productivity",
+    "capabilities": ["Lifecycle hooks"],
+    "defaultPrompt": [
+      "Explain how Stop Review decides whether to continue."
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/stop-review.mjs\" codex",
+            "timeout": 240,
+            "statusMessage": "Reviewing whether work should continue"
+          }
+        ]
+      }
+    ]
+  }
+}

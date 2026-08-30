@@ -1,0 +1,710 @@
+import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import {
+  CONTINUATION_CAP,
+  REVIEW_PROMPT,
+  REVIEW_VERDICT_SCHEMA,
+  countHookContinuations,
+  handleStop,
+  hookOutputForVerdict,
+  parseReviewVerdict,
+  transcriptEvidence,
+} from "../src/stop-review.mjs";
+import * as bundled from "../plugins/stop-review/scripts/stop-review.mjs";
+
+const stopResponse = "STOP";
+const continueResponse = "CONTINUE";
+const consultResponse = "CONSULT";
+
+test("review policy uses the minimal three-verdict protocol", () => {
+  assert.match(REVIEW_PROMPT, /CONTINUE — required work remains/);
+  assert.match(REVIEW_PROMPT, /CONSULT — an unresolved question/);
+  assert.match(REVIEW_PROMPT, /STOP — work is complete/);
+  assert.match(REVIEW_PROMPT, /Reply with exactly one word/);
+  assert.doesNotMatch(REVIEW_PROMPT, /JSON|GitHub|project|conversation|transcript/i);
+});
+
+const ENV_KEYS = [
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_STOP_REVIEW_CLAUDE_BIN",
+  "CODEX_STOP_REVIEW_CODEX_BIN",
+  "CODEX_STOP_REVIEW_GHOST_BIN",
+  "STOP_REVIEW_CLAUDE_BIN",
+  "STOP_REVIEW_CLAUDE_MODEL",
+  "STOP_REVIEW_CODEX_BIN",
+  "STOP_REVIEW_CODEX_MODEL",
+  "STOP_REVIEW_GHOST_BIN",
+  "MOCK_CALL_LOG",
+  "MOCK_REVIEW_RESPONSE",
+  "STOP_REVIEW_AUDIT_LOG",
+];
+
+function transcriptLine(payload, turnId) {
+  return JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "message",
+      ...payload,
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    },
+  });
+}
+
+async function fixture() {
+  const root = await mkdtemp(path.join(tmpdir(), "stop-review-test-"));
+  const codexHome = path.join(root, "codex");
+  const sessions = path.join(codexHome, "sessions", "2026", "08", "26");
+  const transcript = path.join(sessions, "rollout.jsonl");
+  const turnId = "turn-test";
+  const modelMock = path.join(root, "mock-codex.mjs");
+  const callLog = path.join(root, "calls.jsonl");
+
+  await mkdir(sessions, { recursive: true });
+  await writeFile(
+    transcript,
+    [
+      transcriptLine(
+        { role: "user", content: [{ type: "input_text", text: "Please build the requested change." }] },
+        "previous-turn",
+      ),
+      transcriptLine(
+        { role: "assistant", content: [{ type: "output_text", text: "We agreed on the design." }] },
+        "previous-turn",
+      ),
+      transcriptLine(
+        {
+          role: "user",
+          content: [{
+            type: "input_text",
+            text: "<recommended_plugins>injected</recommended_plugins>\n<environment_context>injected</environment_context>",
+          }],
+        },
+        turnId,
+      ),
+      transcriptLine(
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "Build it now. token=supersecretvalue" }],
+        },
+        turnId,
+      ),
+      transcriptLine(
+        { role: "assistant", content: [{ type: "output_text", text: "Candidate final response." }] },
+        turnId,
+      ),
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          turn_id: turnId,
+          item: {
+            type: "CommandExecution",
+            command: ["npm", "test", "--token", "supersecretvalue"],
+            status: "completed",
+            exit_code: 0,
+          },
+        },
+      }),
+    ].join("\n"),
+  );
+
+  await writeFile(
+    modelMock,
+    `#!/usr/bin/env node
+import { appendFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const model = args[args.indexOf("--model") + 1];
+const output = args[args.indexOf("--output-last-message") + 1];
+const value = process.env.MOCK_REVIEW_RESPONSE;
+let prompt = "";
+for await (const chunk of process.stdin) prompt += chunk;
+appendFileSync(process.env.MOCK_CALL_LOG, JSON.stringify({ model, args, prompt }) + "\\n");
+writeFileSync(output, value);
+`,
+  );
+  await chmod(modelMock, 0o755);
+
+  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  process.env.CODEX_HOME = codexHome;
+  process.env.STOP_REVIEW_CODEX_BIN = modelMock;
+  process.env.STOP_REVIEW_CODEX_MODEL = "gpt-5.6-luna";
+  process.env.MOCK_CALL_LOG = callLog;
+  process.env.STOP_REVIEW_AUDIT_LOG = path.join(root, "audit.jsonl");
+
+  return {
+    input: {
+      session_id: "session-test",
+      transcript_path: transcript,
+      turn_id: turnId,
+      stop_hook_active: false,
+      last_assistant_message: "Candidate final response.",
+    },
+    async calls() {
+      try {
+        return (await readFile(callLog, "utf8"))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line));
+      } catch {
+        return [];
+      }
+    },
+    async cleanup() {
+      for (const key of ENV_KEYS) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+async function claudeFixture() {
+  const root = await mkdtemp(path.join(tmpdir(), "claude-stop-review-test-"));
+  const claudeHome = path.join(root, "claude");
+  const projects = path.join(claudeHome, "projects", "-tmp-project");
+  const transcript = path.join(projects, "session-test.jsonl");
+  const modelMock = path.join(root, "mock-claude.mjs");
+  const callLog = path.join(root, "calls.jsonl");
+
+  await mkdir(projects, { recursive: true });
+  await writeFile(
+    transcript,
+    [
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "Earlier context." },
+        origin: { kind: "human" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "Earlier answer." }] },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "Build it now. token=supersecretvalue" },
+        origin: { kind: "human" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            name: "Bash",
+            input: { command: "deploy --token supersecretvalue" },
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", content: "secret result supersecretvalue" }],
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "Candidate final response." }] },
+      }),
+    ].join("\n"),
+  );
+
+  await writeFile(
+    modelMock,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+let prompt = "";
+for await (const chunk of process.stdin) prompt += chunk;
+const args = process.argv.slice(2);
+const model = args[args.indexOf("--model") + 1];
+const effortIndex = args.indexOf("--effort");
+const effort = effortIndex >= 0 ? args[effortIndex + 1] : undefined;
+const value = process.env.MOCK_REVIEW_RESPONSE;
+appendFileSync(process.env.MOCK_CALL_LOG, JSON.stringify({ model, effort, args, prompt }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "\\n" + value + "\\n" }));
+`,
+  );
+  await chmod(modelMock, 0o755);
+
+  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  process.env.CLAUDE_CONFIG_DIR = claudeHome;
+  process.env.STOP_REVIEW_CLAUDE_BIN = modelMock;
+  process.env.STOP_REVIEW_CLAUDE_MODEL = "sonnet";
+  process.env.MOCK_CALL_LOG = callLog;
+  process.env.STOP_REVIEW_AUDIT_LOG = path.join(root, "audit.jsonl");
+
+  return {
+    input: {
+      session_id: "session-test",
+      transcript_path: transcript,
+      stop_hook_active: false,
+      last_assistant_message: "Candidate final response.",
+      background_tasks: [],
+      session_crons: [],
+    },
+    async calls() {
+      try {
+        return (await readFile(callLog, "utf8"))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line));
+      } catch {
+        return [];
+      }
+    },
+    async cleanup() {
+      for (const key of ENV_KEYS) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+async function ghostFixture() {
+  const root = await mkdtemp(path.join(tmpdir(), "ghost-stop-review-test-"));
+  const modelMock = path.join(root, "mock-ghostd.mjs");
+  const callLog = path.join(root, "calls.jsonl");
+  const ghostHome = path.join(root, "ghosts", "casper");
+
+  await mkdir(ghostHome, { recursive: true });
+  await writeFile(
+    modelMock,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+appendFileSync(process.env.MOCK_CALL_LOG, JSON.stringify({ args: process.argv.slice(2), input: JSON.parse(input) }) + "\\n");
+process.stdout.write(JSON.stringify({ text: process.env.MOCK_REVIEW_RESPONSE }));
+`,
+  );
+  await chmod(modelMock, 0o755);
+
+  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  process.env.STOP_REVIEW_GHOST_BIN = modelMock;
+  process.env.MOCK_CALL_LOG = callLog;
+  process.env.STOP_REVIEW_AUDIT_LOG = path.join(root, "audit.jsonl");
+
+  return {
+    input: {
+      type: "session_stop",
+      session_id: "session-test",
+      ghost_name: "casper",
+      ghost_home: ghostHome,
+      owner_prompt: "Please finish the requested change.",
+      runtime: "omp",
+      messages: [{
+        role: "assistant",
+        content: [{ type: "text", text: "Candidate final response." }],
+      }],
+      last_assistant_message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Candidate final response." }],
+      },
+      stop_hook_active: false,
+    },
+    async calls() {
+      try {
+        return (await readFile(callLog, "utf8"))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line));
+      } catch {
+        return [];
+      }
+    },
+    async cleanup() {
+      for (const key of ENV_KEYS) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("transcript evidence redacts secrets and omits tool payloads", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    const evidence = await transcriptEvidence(context.input);
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /supersecretvalue/);
+    assert.doesNotMatch(serialized, /recommended_plugins/);
+    assert.equal(evidence.initial_user_request, "Build it now. token=[REDACTED]");
+    assert.deepEqual(evidence.tool_events, [
+      { type: "command", status: "completed", category: "test", exit_code: 0, outcome: "succeeded" },
+    ]);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("STOP accepts the stop", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = stopResponse;
+    const output = await handleStop(context.input);
+    assert.deepEqual(output, {});
+    const calls = await context.calls();
+    assert.deepEqual(calls.map((item) => item.model), ["gpt-5.6-luna"]);
+    assert.ok(!calls[0].args.some((arg) => arg.includes("model_reasoning_effort")));
+    assert.ok(!calls[0].args.includes("--output-schema"));
+    assert.match(calls[0].prompt, /"last_assistant_message":"Candidate final response\."/);
+    assert.doesNotMatch(calls[0].prompt, /Build it now|supersecretvalue|tool_events|project_context/);
+    const audit = JSON.parse((await readFile(process.env.STOP_REVIEW_AUDIT_LOG, "utf8")).trim());
+    assert.equal(audit.verdict, "STOP");
+    assert.equal(audit.rationale, "");
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("last_assistant_message is reviewed when the transcript is unavailable", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop({ ...context.input, transcript_path: null });
+    assert.deepEqual(output, { decision: "block", reason: "Please continue." });
+    const [call] = await context.calls();
+    assert.match(call.prompt, /"last_assistant_message":"Candidate final response\."/);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("CONTINUE maps to the fixed Stop-hook continuation", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop(context.input);
+    assert.deepEqual(output, {
+      decision: "block",
+      reason: "Please continue.",
+    });
+    assert.deepEqual((await context.calls()).map((item) => item.model), ["gpt-5.6-luna"]);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("CONSULT maps to the fixed advisor continuation", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = consultResponse;
+    const output = await handleStop(context.input);
+    assert.deepEqual(output, {
+      decision: "block",
+      reason: "Please consult the advisor, then continue.",
+    });
+    assert.deepEqual((await context.calls()).map((item) => item.model), ["gpt-5.6-luna"]);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("human-only blockers stop without another prompt", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = stopResponse;
+    assert.deepEqual(await handleStop(context.input), {});
+    assert.equal((await context.calls()).length, 1);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("invalid reviewer verdict fails open", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = "CONSULT_ADVISOR";
+    const output = await handleStop(context.input);
+    assert.match(output.systemMessage, /exactly CONTINUE, CONSULT, or STOP/);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Claude transcript evidence omits tool inputs and results", { concurrency: false }, async () => {
+  const context = await claudeFixture();
+  try {
+    const evidence = await transcriptEvidence(context.input, "claude");
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /supersecretvalue/);
+    assert.equal(evidence.initial_user_request, "Build it now. token=[REDACTED]");
+    assert.deepEqual(evidence.tool_events, [
+      { type: "Bash", status: "requested" },
+      { type: "tool_result", status: "completed" },
+    ]);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Claude uses Sonnet with its default effort for classification", { concurrency: false }, async () => {
+  const context = await claudeFixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = stopResponse;
+    const output = await handleStop(context.input, "claude");
+    assert.deepEqual(output, {});
+    const [call] = await context.calls();
+    assert.equal(call.model, "sonnet");
+    assert.equal(call.effort, undefined);
+    assert.ok(!call.args.includes("--effort"));
+    assert.ok(call.args.includes("--safe-mode"));
+    assert.ok(call.args.includes("--no-session-persistence"));
+    assert.equal(call.args[call.args.indexOf("--tools") + 1], "");
+    assert.ok(!call.args.includes("--json-schema"));
+    assert.equal(call.args[call.args.indexOf("--max-turns") + 1], "1");
+    assert.match(call.prompt, /Reply with exactly one word/);
+    assert.match(call.prompt, /"last_assistant_message":"Candidate final response\."/);
+    assert.doesNotMatch(call.prompt, /Build it now|supersecretvalue|tool_events|project_context/);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Ghost delegates classification to its smol-model bridge", { concurrency: false }, async () => {
+  const context = await ghostFixture();
+  try {
+    process.env.MOCK_REVIEW_RESPONSE = consultResponse;
+    const output = await handleStop(context.input, "ghost");
+    assert.deepEqual(output, {
+      decision: "block",
+      reason: "Please consult the advisor, then continue.",
+    });
+    const [call] = await context.calls();
+    assert.deepEqual(call.args, ["hook-smol-complete"]);
+    assert.equal(call.input.ghost_home, context.input.ghost_home);
+    assert.match(call.input.prompt, /Reply with exactly one word/);
+    assert.match(call.input.prompt, /"last_assistant_message":"Candidate final response\."/);
+    assert.doesNotMatch(call.input.prompt, /Please finish the requested change/);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Zod accepts only the exact review verdict enum", () => {
+  for (const verdict of ["CONTINUE", "CONSULT", "STOP"]) {
+    assert.equal(parseReviewVerdict(` ${verdict}\n`), verdict);
+    assert.equal(REVIEW_VERDICT_SCHEMA.safeParse(verdict).success, true);
+  }
+  for (const invalid of ["continue", "CONSULT_ADVISOR", "STOP now", "{}", ""]) {
+    assert.equal(REVIEW_VERDICT_SCHEMA.safeParse(invalid).success, false);
+    assert.throws(() => parseReviewVerdict(invalid), /exactly CONTINUE, CONSULT, or STOP/);
+  }
+  assert.deepEqual(hookOutputForVerdict("CONTINUE"), { decision: "block", reason: "Please continue." });
+  assert.deepEqual(hookOutputForVerdict("CONSULT"), {
+    decision: "block",
+    reason: "Please consult the advisor, then continue.",
+  });
+  assert.deepEqual(hookOutputForVerdict("STOP"), {});
+});
+
+test("bundled plugin preserves the validated verdict protocol", () => {
+  for (const verdict of ["CONTINUE", "CONSULT", "STOP"]) {
+    assert.equal(bundled.parseReviewVerdict(verdict), verdict);
+    assert.deepEqual(bundled.hookOutputForVerdict(verdict), hookOutputForVerdict(verdict));
+  }
+  assert.equal(bundled.REVIEW_PROMPT, REVIEW_PROMPT);
+});
+
+test("continuation cap counts only host-injected hook prompts", () => {
+  assert.equal(CONTINUATION_CAP, 10);
+  assert.equal(countHookContinuations([
+    "Stop hook feedback:\ncontinue",
+    '<hook_prompt hook_run_id="stop:1:/x/hooks.json">continue</hook_prompt>',
+    "please keep going",
+    "Stop hook feedback: please consult the advisor with these open questions, then continue:\n- q",
+  ]), 3);
+  assert.equal(countHookContinuations(undefined), 0);
+});
+
+test("Claude stops unconditionally once the continuation cap is reached", { concurrency: false }, async () => {
+  const context = await claudeFixture();
+  try {
+    const feedback = Array.from({ length: CONTINUATION_CAP }, () =>
+      JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "Stop hook feedback:\ncontinue" } })
+    );
+    const existing = await readFile(context.input.transcript_path, "utf8");
+    await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${feedback.join("\n")}\n`);
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop(context.input, "claude");
+    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.equal((await context.calls()).length, 0);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Codex stops unconditionally once the continuation cap is reached", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    const feedback = Array.from({ length: CONTINUATION_CAP }, () =>
+      transcriptLine({ role: "user", content: [{ type: "input_text", text: '<hook_prompt hook_run_id="stop:1:/x">continue</hook_prompt>' }] }, context.input.turn_id)
+    );
+    const existing = await readFile(context.input.transcript_path, "utf8");
+    await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${feedback.join("\n")}\n`);
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop(context.input);
+    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.equal((await context.calls()).length, 0);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+function piLine(entry, id, parentId) {
+  return JSON.stringify({ id, parentId, timestamp: "2026-08-28T00:00:00.000Z", ...entry });
+}
+
+async function piTranscriptFixture(context, { continuations = 1 } = {}) {
+  const sessionDir = path.join(context.input.ghost_home, "sessions");
+  await mkdir(sessionDir, { recursive: true });
+  const transcript = path.join(sessionDir, "conv.jsonl");
+  const lines = [
+    JSON.stringify({ type: "session", version: 3, id: "conv", timestamp: "2026-08-28T00:00:00.000Z", cwd: "/tmp" }),
+    piLine({ type: "message", message: { role: "user", content: [{ type: "text", text: "Earlier owner prompt." }] } }, "m1", null),
+    piLine({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Earlier answer." }] } }, "m2", "m1"),
+    // An abandoned branch that must not leak into the evidence.
+    piLine({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Abandoned branch answer." }] } }, "m2b", "m1"),
+    piLine({ type: "message", message: { role: "user", content: [{ type: "text", text: context.input.owner_prompt }] } }, "m3", "m2"),
+    piLine({ type: "message", message: { role: "assistant", content: [
+      { type: "thinking", thinking: "private" },
+      { type: "toolCall", id: "call-1", name: "read", arguments: { path: "/etc/passwd" } },
+    ] } }, "m4", "m3"),
+    piLine({ type: "message", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: false, content: [{ type: "text", text: "secret result supersecretvalue" }] } }, "m5", "m4"),
+    piLine({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "First pass." }] } }, "m6", "m5"),
+  ];
+  let parent = "m6";
+  for (let index = 0; index < continuations; index += 1) {
+    const marker = `c${index}`;
+    const pass = `p${index}`;
+    lines.push(piLine({ type: "custom_message", customType: "session-stop-continuation", content: "continue", display: false, attribution: "agent" }, marker, parent));
+    lines.push(piLine({ type: "message", message: { role: "assistant", content: [{ type: "text", text: `Pass ${index + 2}.` }] } }, pass, marker));
+    parent = pass;
+  }
+  await writeFile(transcript, `${lines.join("\n")}\n`);
+  return transcript;
+}
+
+test("Ghost reviews the whole owner turn from its Pi transcript", { concurrency: false }, async () => {
+  const context = await ghostFixture();
+  try {
+    const transcript = await piTranscriptFixture(context);
+    const input = {
+      ...context.input,
+      conversation_runtime: "pi",
+      transcript_path: transcript,
+      last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Pass 2." }] },
+    };
+    const evidence = await transcriptEvidence(input, "ghost");
+    assert.equal(evidence.initial_user_request, context.input.owner_prompt);
+    assert.deepEqual(evidence.continuation_prompts, ["continue"]);
+    assert.deepEqual(evidence.recent_context, [
+      { role: "user", text: "Earlier owner prompt." },
+      { role: "assistant", text: "Earlier answer." },
+    ]);
+    assert.deepEqual(evidence.current_turn_messages.map((item) => item.text), [
+      context.input.owner_prompt,
+      "First pass.",
+      "continue",
+      "Pass 2.",
+    ]);
+    assert.deepEqual(evidence.tool_events, [
+      { type: "read", status: "requested" },
+      { type: "tool_result", status: "completed" },
+    ]);
+    assert.equal(evidence.assistant_stop_candidate, "Pass 2.");
+    assert.equal(evidence.ghost_runtime, "omp");
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /supersecretvalue|Abandoned branch|private|\/etc\/passwd/);
+
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop(input, "ghost");
+    assert.deepEqual(output, { decision: "block", reason: "Please continue." });
+    const [call] = await context.calls();
+    assert.match(call.input.prompt, /"last_assistant_message":"Pass 2\."/);
+    assert.doesNotMatch(call.input.prompt, /Earlier owner prompt|continuation_prompts|First pass/);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Ghost rejects a transcript outside the ghost home and falls back without one", { concurrency: false }, async () => {
+  const context = await ghostFixture();
+  try {
+    const outside = path.join(path.dirname(context.input.ghost_home), "outside.jsonl");
+    await writeFile(outside, "");
+    const output = await handleStop({ ...context.input, conversation_runtime: "pi", transcript_path: outside }, "ghost");
+    assert.match(output.systemMessage, /outside the ghost transcript directories/);
+    assert.equal((await context.calls()).length, 0);
+
+    const evidence = await transcriptEvidence(context.input, "ghost");
+    assert.deepEqual(evidence.continuation_prompts, []);
+    assert.equal(evidence.initial_user_request, context.input.owner_prompt);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Ghost stops unconditionally once the continuation cap is reached", { concurrency: false }, async () => {
+  const context = await ghostFixture();
+  try {
+    const transcript = await piTranscriptFixture(context, { continuations: CONTINUATION_CAP });
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop({ ...context.input, conversation_runtime: "pi", transcript_path: transcript }, "ghost");
+    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.equal((await context.calls()).length, 0);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("Ghost's Claude Code runtime anchors the turn on the owner prompt", { concurrency: false }, async () => {
+  const context = await ghostFixture();
+  const claudeHome = await mkdtemp(path.join(tmpdir(), "ghost-claude-home-"));
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.CLAUDE_CONFIG_DIR = claudeHome;
+    const projectDir = path.join(claudeHome, "projects", "-tmp-project");
+    await mkdir(projectDir, { recursive: true });
+    const transcript = path.join(projectDir, "sdk-session.jsonl");
+    await writeFile(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "Older prompt." } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Older answer." }] } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: context.input.owner_prompt } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "First pass." }] } }),
+      // Ghost's Claude Code runtime re-prompts with a plain user message.
+      JSON.stringify({ type: "user", message: { role: "user", content: "continue" } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Second pass." }] } }),
+    ].join("\n"));
+    const evidence = await transcriptEvidence({
+      ...context.input,
+      runtime: "claude-code",
+      conversation_runtime: "claude-code",
+      transcript_path: transcript,
+      last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Second pass." }] },
+    }, "ghost");
+    assert.equal(evidence.initial_user_request, context.input.owner_prompt);
+    assert.deepEqual(evidence.continuation_prompts, ["continue"]);
+    assert.deepEqual(evidence.recent_context.map((item) => item.text), ["Older prompt.", "Older answer."]);
+    assert.equal(evidence.assistant_stop_candidate, "Second pass.");
+    assert.equal(evidence.ghost_runtime, "claude-code");
+    assert.equal(evidence.background_activity, undefined);
+  } finally {
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    await rm(claudeHome, { recursive: true, force: true });
+    await context.cleanup();
+  }
+});
