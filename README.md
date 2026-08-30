@@ -21,7 +21,7 @@ the host response:
 Add this repository as a Codex marketplace, then install the plugin:
 
 ```bash
-codex plugin marketplace add ferdousbhai/stop-review --ref main
+codex plugin marketplace add ferdousbhai/stop-review --ref v0.1.0
 codex plugin add stop-review@stop-review
 ```
 
@@ -31,7 +31,7 @@ you do not need to clone the repository or run `npm install`.
 ## Install for Claude Code
 
 ```bash
-npx --yes github:ferdousbhai/stop-review --claude
+npx --yes github:ferdousbhai/stop-review#v0.1.0 --claude
 ```
 
 The installer copies the bundled hook to `~/.local/share/stop-review/` and merges a
@@ -41,7 +41,7 @@ hooks are preserved.
 Uninstall it with:
 
 ```bash
-npx --yes github:ferdousbhai/stop-review --uninstall --claude
+npx --yes github:ferdousbhai/stop-review#v0.1.0 --uninstall --claude
 ```
 
 ## Install for Ghost
@@ -50,13 +50,13 @@ Ghost must already be installed, and `ghostd hook-smol-complete` must run succes
 Then install the `session_stop` hook:
 
 ```bash
-npx --yes github:ferdousbhai/stop-review --ghost
+npx --yes github:ferdousbhai/stop-review#v0.1.0 --ghost
 ```
 
 Uninstall it with:
 
 ```bash
-npx --yes github:ferdousbhai/stop-review --uninstall --ghost
+npx --yes github:ferdousbhai/stop-review#v0.1.0 --uninstall --ghost
 ```
 
 Use `--all` instead of `--claude` or `--ghost` to configure both runtimes.
