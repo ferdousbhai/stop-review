@@ -7,14 +7,13 @@ import {
   readFile,
   realpath,
   rm,
-  writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { z } from "zod/mini";
+import * as z from "zod/mini";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MODEL_OUTPUT_LIMIT = 2 * 1024 * 1024;
@@ -111,6 +110,19 @@ function isInjectedContext(text) {
   );
 }
 
+async function* jsonLines(file) {
+  const stream = createReadStream(file, { encoding: "utf8" });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of lines) {
+    try {
+      yield JSON.parse(line);
+    } catch {
+      // Ignore incomplete or non-JSON transcript lines.
+    }
+  }
+}
+
 function boundMessages(messages, maxMessages, maxChars) {
   const selected = [];
   let chars = 0;
@@ -124,10 +136,38 @@ function boundMessages(messages, maxMessages, maxChars) {
   selected.reverse();
 
   const firstUser = messages.find((item) => item.role === "user");
-  if (firstUser && !selected.some((item) => item.text === compactText(firstUser.text))) {
-    selected.unshift({ role: "user", text: compactText(firstUser.text) });
+  if (firstUser) {
+    const firstUserText = compactText(firstUser.text);
+    if (!selected.some((item) => item.role === "user" && item.text === firstUserText)) {
+      selected.unshift({ role: "user", text: firstUserText });
+    }
   }
   return selected;
+}
+
+function transcriptSummary(previous, current, tools, assistantStopCandidate, initialFallback = null) {
+  const currentMessages = boundMessages(current, 30, 42_000);
+  const currentUserMessages = current.filter((item) => item.role === "user");
+  return {
+    recent_context: boundMessages(previous, 12, 24_000),
+    initial_user_request: currentUserMessages[0]
+      ? compactText(currentUserMessages[0].text)
+      : initialFallback,
+    continuation_prompts: currentUserMessages
+      .slice(1)
+      .map((item) => compactText(item.text)),
+    current_turn_messages: currentMessages,
+    tool_events: tools.slice(-50),
+    assistant_stop_candidate: compactText(assistantStopCandidate, 12_000),
+  };
+}
+
+function turnStartIndex(items, ownerPrompt, ownerText) {
+  if (ownerPrompt) {
+    const matchingOwner = items.findLastIndex((item) => ownerText(item)?.trim() === ownerPrompt);
+    if (matchingOwner >= 0) return matchingOwner;
+  }
+  return items.findLastIndex((item) => ownerText(item) !== null);
 }
 
 function commandText(command) {
@@ -204,16 +244,7 @@ async function codexTranscriptEvidence(input) {
   const current = [];
   const previous = [];
   const tools = [];
-  const stream = createReadStream(transcriptPath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  for await (const line of lines) {
-    let record;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  for await (const record of jsonLines(transcriptPath)) {
     const turnId = recordTurnId(record);
     const payload = record?.payload;
 
@@ -236,18 +267,7 @@ async function codexTranscriptEvidence(input) {
     }
   }
 
-  const currentMessages = boundMessages(current, 30, 42_000);
-  const recentContext = boundMessages(previous, 12, 24_000);
-  const currentUserMessages = currentMessages.filter((item) => item.role === "user");
-
-  return {
-    recent_context: recentContext,
-    initial_user_request: currentUserMessages[0]?.text ?? null,
-    continuation_prompts: currentUserMessages.slice(1).map((item) => item.text),
-    current_turn_messages: currentMessages,
-    tool_events: tools.slice(-50),
-    assistant_stop_candidate: compactText(input.last_assistant_message ?? "", 12_000),
-  };
+  return transcriptSummary(previous, current, tools, input.last_assistant_message ?? "");
 }
 
 function claudeMessage(record) {
@@ -306,31 +326,16 @@ function stopCandidateText(input) {
 async function claudeTranscriptEvidence(input, options = {}) {
   const transcriptPath = options.transcriptPath ?? await allowedTranscriptPath(input.transcript_path, "claude");
   const records = [];
-  const stream = createReadStream(transcriptPath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  for await (const line of lines) {
-    try {
-      records.push(JSON.parse(line));
-    } catch {
-      // Ignore incomplete or non-JSON transcript lines.
-    }
-  }
+  for await (const record of jsonLines(transcriptPath)) records.push(record);
 
   // The current turn starts at the last genuine user message. A host that
   // re-prompts with plain user messages (ghost's Claude Code runtime) supplies
   // the owner prompt so those continuations stay inside the turn.
   const ownerPrompt = typeof options.ownerPrompt === "string" ? options.ownerPrompt.trim() : null;
-  let turnStart = -1;
-  for (const matchOwner of ownerPrompt ? [true, false] : [false]) {
-    for (let index = records.length - 1; index >= 0 && turnStart < 0; index -= 1) {
-      const message = claudeMessage(records[index]);
-      if (!message?.genuineUser) continue;
-      if (matchOwner && message.text.trim() !== ownerPrompt) continue;
-      turnStart = index;
-    }
-    if (turnStart >= 0) break;
-  }
+  const turnStart = turnStartIndex(records, ownerPrompt, (record) => {
+    const message = claudeMessage(record);
+    return message?.genuineUser ? message.text : null;
+  });
 
   const previous = [];
   const current = [];
@@ -343,16 +348,8 @@ async function claudeTranscriptEvidence(input, options = {}) {
     if (index >= turnStart && turnStart >= 0) tools.push(...claudeToolEvents(record));
   });
 
-  const currentMessages = boundMessages(current, 30, 42_000);
-  const recentContext = boundMessages(previous, 12, 24_000);
-  const currentUserMessages = currentMessages.filter((item) => item.role === "user");
   return {
-    recent_context: recentContext,
-    initial_user_request: currentUserMessages[0]?.text ?? null,
-    continuation_prompts: currentUserMessages.slice(1).map((item) => item.text),
-    current_turn_messages: currentMessages,
-    tool_events: tools.slice(-50),
-    assistant_stop_candidate: compactText(stopCandidateText(input), 12_000),
+    ...transcriptSummary(previous, current, tools, stopCandidateText(input)),
     background_activity: {
       tasks: Array.isArray(input.background_tasks) ? input.background_tasks.length : 0,
       scheduled_jobs: Array.isArray(input.session_crons) ? input.session_crons.length : 0,
@@ -382,15 +379,7 @@ function piActiveBranch(records) {
 
 async function piTranscriptEvidence(input, transcriptPath) {
   const records = [];
-  const stream = createReadStream(transcriptPath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  for await (const line of lines) {
-    try {
-      records.push(JSON.parse(line));
-    } catch {
-      // Ignore incomplete or non-JSON transcript lines.
-    }
-  }
+  for await (const record of jsonLines(transcriptPath)) records.push(record);
 
   // One timeline of owner prompts, hook continuations, assistant passes and tool events.
   const timeline = [];
@@ -422,16 +411,11 @@ async function piTranscriptEvidence(input, transcriptPath) {
   }
 
   const ownerPrompt = typeof input.owner_prompt === "string" ? input.owner_prompt.trim() : "";
-  let turnStart = -1;
-  for (const matchOwner of ownerPrompt ? [true, false] : [false]) {
-    for (let index = timeline.length - 1; index >= 0 && turnStart < 0; index -= 1) {
-      const item = timeline[index];
-      if (item.kind !== "message" || !item.owner) continue;
-      if (matchOwner && item.text.trim() !== ownerPrompt) continue;
-      turnStart = index;
-    }
-    if (turnStart >= 0) break;
-  }
+  const turnStart = turnStartIndex(
+    timeline,
+    ownerPrompt,
+    (item) => item.kind === "message" && item.owner ? item.text : null,
+  );
 
   const previous = [];
   const current = [];
@@ -442,16 +426,8 @@ async function piTranscriptEvidence(input, transcriptPath) {
     else if (inTurn) tools.push(item.event);
   });
 
-  const currentMessages = boundMessages(current, 30, 42_000);
-  const recentContext = boundMessages(previous, 12, 24_000);
-  const currentUserMessages = currentMessages.filter((item) => item.role === "user");
   return {
-    recent_context: recentContext,
-    initial_user_request: currentUserMessages[0]?.text ?? (ownerPrompt || null),
-    continuation_prompts: currentUserMessages.slice(1).map((item) => item.text),
-    current_turn_messages: currentMessages,
-    tool_events: tools.slice(-50),
-    assistant_stop_candidate: compactText(stopCandidateText(input), 12_000),
+    ...transcriptSummary(previous, current, tools, stopCandidateText(input), ownerPrompt || null),
     ghost_runtime: input.runtime ?? null,
   };
 }
@@ -513,6 +489,7 @@ async function transcriptEvidence(input, runner = "codex") {
 
 async function readStdin() {
   let value = "";
+  process.stdin.setEncoding("utf8");
   for await (const chunk of process.stdin) {
     value += chunk;
     if (Buffer.byteLength(value) > MAX_STDIN_BYTES) {
@@ -534,8 +511,8 @@ function appendLimited(current, chunk) {
   return next;
 }
 
-async function runProcess(command, args, input, timeoutMs, env = process.env, cwd) {
-  return await new Promise((resolve, reject) => {
+function runProcess(command, args, input, timeoutMs, env = process.env, cwd) {
+  return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env,
       cwd,
@@ -544,6 +521,9 @@ async function runProcess(command, args, input, timeoutMs, env = process.env, cw
     let stdout = "";
     let stderr = "";
     let settled = false;
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
 
     const fail = (error) => {
       if (settled) return;
@@ -565,14 +545,14 @@ async function runProcess(command, args, input, timeoutMs, env = process.env, cw
     });
     child.stdout.on("data", (chunk) => {
       try {
-        stdout = appendLimited(stdout, chunk.toString());
+        stdout = appendLimited(stdout, chunk);
       } catch (error) {
         fail(error);
       }
     });
     child.stderr.on("data", (chunk) => {
       try {
-        stderr = appendLimited(stderr, chunk.toString());
+        stderr = appendLimited(stderr, chunk);
       } catch (error) {
         fail(error);
       }

@@ -77,3 +77,19 @@ test("installer requires an explicit target", async () => {
   assert.equal(result.code, 1);
   assert.match(result.stderr, /Select --claude, --ghost, or --all/);
 });
+
+test("uninstalling an absent hook does not create a settings file", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "stop-review-uninstall-"));
+  const settings = path.join(root, "claude", "settings.json");
+  try {
+    const result = await runInstaller(["--uninstall", "--claude"], {
+      STOP_REVIEW_HOME: path.join(root, "home"),
+      XDG_DATA_HOME: path.join(root, "data"),
+      CLAUDE_CONFIG_DIR: path.dirname(settings),
+    });
+    assert.equal(result.code, 0, result.stderr);
+    await assert.rejects(access(settings), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

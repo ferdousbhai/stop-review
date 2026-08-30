@@ -6,6 +6,7 @@ import {
   mkdir,
   readFile,
   rename,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -45,10 +46,14 @@ function shellQuote(value) {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function isJsonObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 async function readJson(file, fallback) {
   try {
     const value = JSON.parse(await readFile(file, "utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (!isJsonObject(value)) {
       throw new Error(`${file} must contain a JSON object`);
     }
     return value;
@@ -61,11 +66,15 @@ async function readJson(file, fallback) {
 async function writeJsonAtomic(file, value) {
   await mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await rename(temporary, file);
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
 }
 
 function installedCommand(hookFile, runner) {
@@ -93,9 +102,7 @@ function removeInstalledHooks(groups, hookFile, runner) {
 }
 
 function updateHookConfig(config, event, hookFile, runner, uninstall) {
-  const hooks = config.hooks && typeof config.hooks === "object" && !Array.isArray(config.hooks)
-    ? { ...config.hooks }
-    : {};
+  const hooks = isJsonObject(config.hooks) ? { ...config.hooks } : {};
   const groups = removeInstalledHooks(hooks[event], hookFile, runner);
   if (!uninstall) {
     groups.push({
@@ -137,7 +144,11 @@ async function main() {
       ? path.join(process.env.CLAUDE_CONFIG_DIR || path.join(userHome, ".claude"), "settings.json")
       : path.join(configHome, "ghost", "hooks.json");
     const event = runner === "claude" ? "Stop" : "session_stop";
-    const config = await readJson(settingsFile, {});
+    const config = await readJson(settingsFile, uninstall ? null : {});
+    if (config === null) {
+      process.stdout.write(`Removed ${runner} hook in ${settingsFile}\n`);
+      continue;
+    }
     await writeJsonAtomic(
       settingsFile,
       updateHookConfig(config, event, hookFile, runner, uninstall),

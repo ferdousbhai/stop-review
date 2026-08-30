@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -43,6 +43,29 @@ const ENV_KEYS = [
   "MOCK_REVIEW_RESPONSE",
   "STOP_REVIEW_AUDIT_LOG",
 ];
+
+function environmentSnapshot() {
+  return Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+}
+
+function restoreEnvironment(snapshot) {
+  for (const key of ENV_KEYS) {
+    if (snapshot[key] === undefined) delete process.env[key];
+    else process.env[key] = snapshot[key];
+  }
+}
+
+async function readCalls(callLog) {
+  try {
+    return (await readFile(callLog, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
 
 function transcriptLine(payload, turnId) {
   return JSON.stringify({
@@ -129,7 +152,7 @@ writeFileSync(output, value);
   );
   await chmod(modelMock, 0o755);
 
-  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  const previous = environmentSnapshot();
   process.env.CODEX_HOME = codexHome;
   process.env.STOP_REVIEW_CODEX_BIN = modelMock;
   process.env.STOP_REVIEW_CODEX_MODEL = "gpt-5.6-luna";
@@ -144,22 +167,9 @@ writeFileSync(output, value);
       stop_hook_active: false,
       last_assistant_message: "Candidate final response.",
     },
-    async calls() {
-      try {
-        return (await readFile(callLog, "utf8"))
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => JSON.parse(line));
-      } catch {
-        return [];
-      }
-    },
+    calls: () => readCalls(callLog),
     async cleanup() {
-      for (const key of ENV_KEYS) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
+      restoreEnvironment(previous);
       await rm(root, { recursive: true, force: true });
     },
   };
@@ -233,7 +243,7 @@ process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_err
   );
   await chmod(modelMock, 0o755);
 
-  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  const previous = environmentSnapshot();
   process.env.CLAUDE_CONFIG_DIR = claudeHome;
   process.env.STOP_REVIEW_CLAUDE_BIN = modelMock;
   process.env.STOP_REVIEW_CLAUDE_MODEL = "sonnet";
@@ -249,22 +259,9 @@ process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_err
       background_tasks: [],
       session_crons: [],
     },
-    async calls() {
-      try {
-        return (await readFile(callLog, "utf8"))
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => JSON.parse(line));
-      } catch {
-        return [];
-      }
-    },
+    calls: () => readCalls(callLog),
     async cleanup() {
-      for (const key of ENV_KEYS) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
+      restoreEnvironment(previous);
       await rm(root, { recursive: true, force: true });
     },
   };
@@ -289,7 +286,7 @@ process.stdout.write(JSON.stringify({ text: process.env.MOCK_REVIEW_RESPONSE }))
   );
   await chmod(modelMock, 0o755);
 
-  const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  const previous = environmentSnapshot();
   process.env.STOP_REVIEW_GHOST_BIN = modelMock;
   process.env.MOCK_CALL_LOG = callLog;
   process.env.STOP_REVIEW_AUDIT_LOG = path.join(root, "audit.jsonl");
@@ -312,22 +309,9 @@ process.stdout.write(JSON.stringify({ text: process.env.MOCK_REVIEW_RESPONSE }))
       },
       stop_hook_active: false,
     },
-    async calls() {
-      try {
-        return (await readFile(callLog, "utf8"))
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => JSON.parse(line));
-      } catch {
-        return [];
-      }
-    },
+    calls: () => readCalls(callLog),
     async cleanup() {
-      for (const key of ENV_KEYS) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
+      restoreEnvironment(previous);
       await rm(root, { recursive: true, force: true });
     },
   };
@@ -344,6 +328,30 @@ test("transcript evidence redacts secrets and omits tool payloads", { concurrenc
     assert.deepEqual(evidence.tool_events, [
       { type: "command", status: "completed", category: "test", exit_code: 0, outcome: "succeeded" },
     ]);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("transcript evidence retains the initial user message when an assistant repeats it", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    const repeated = "Build it now. token=supersecretvalue";
+    const assistantMessages = Array.from({ length: 31 }, (_, index) =>
+      transcriptLine({
+        role: "assistant",
+        content: [{ type: "output_text", text: index === 30 ? repeated : `Pass ${index}.` }],
+      }, context.input.turn_id)
+    );
+    const existing = await readFile(context.input.transcript_path, "utf8");
+    await writeFile(context.input.transcript_path, `${existing}\n${assistantMessages.join("\n")}\n`);
+
+    const evidence = await transcriptEvidence(context.input);
+    assert.equal(evidence.initial_user_request, "Build it now. token=[REDACTED]");
+    assert.deepEqual(evidence.current_turn_messages[0], {
+      role: "user",
+      text: "Build it now. token=[REDACTED]",
+    });
   } finally {
     await context.cleanup();
   }
@@ -518,6 +526,11 @@ test("bundled plugin preserves the validated verdict protocol", () => {
   assert.equal(bundled.REVIEW_PROMPT, REVIEW_PROMPT);
 });
 
+test("bundled plugin keeps Zod Mini tree-shakeable", async () => {
+  const bundle = await stat(new URL("../plugins/stop-review/scripts/stop-review.mjs", import.meta.url));
+  assert.ok(bundle.size < 64 * 1024, `expected bundle below 64 KiB, received ${bundle.size} bytes`);
+});
+
 test("continuation cap counts only host-injected hook prompts", () => {
   assert.equal(CONTINUATION_CAP, 10);
   assert.equal(countHookContinuations([
@@ -554,6 +567,37 @@ test("Codex stops unconditionally once the continuation cap is reached", { concu
     );
     const existing = await readFile(context.input.transcript_path, "utf8");
     await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${feedback.join("\n")}\n`);
+    process.env.MOCK_REVIEW_RESPONSE = continueResponse;
+    const output = await handleStop(context.input);
+    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.equal((await context.calls()).length, 0);
+  } finally {
+    await context.cleanup();
+  }
+});
+
+test("verbose assistant passes cannot hide the Codex continuation cap", { concurrency: false }, async () => {
+  const context = await fixture();
+  try {
+    const records = [];
+    for (let continuation = 0; continuation < CONTINUATION_CAP; continuation += 1) {
+      records.push(transcriptLine({
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: `<hook_prompt hook_run_id="stop:${continuation}:/x">continue</hook_prompt>`,
+        }],
+      }, context.input.turn_id));
+      for (let update = 0; update < 4; update += 1) {
+        records.push(transcriptLine({
+          role: "assistant",
+          content: [{ type: "output_text", text: `Update ${continuation}.${update}.` }],
+        }, context.input.turn_id));
+      }
+    }
+    const existing = await readFile(context.input.transcript_path, "utf8");
+    await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${records.join("\n")}\n`);
+
     process.env.MOCK_REVIEW_RESPONSE = continueResponse;
     const output = await handleStop(context.input);
     assert.match(output.systemMessage, /continuation cap \(10\) reached/);
