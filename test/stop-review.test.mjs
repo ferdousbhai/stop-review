@@ -532,7 +532,7 @@ test("bundled plugin keeps Zod Mini tree-shakeable", async () => {
 });
 
 test("continuation cap counts only host-injected hook prompts", () => {
-  assert.equal(CONTINUATION_CAP, 10);
+  assert.equal(CONTINUATION_CAP, 20);
   assert.equal(countHookContinuations([
     "Stop hook feedback:\ncontinue",
     '<hook_prompt hook_run_id="stop:1:/x/hooks.json">continue</hook_prompt>',
@@ -552,7 +552,7 @@ test("Claude stops unconditionally once the continuation cap is reached", { conc
     await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${feedback.join("\n")}\n`);
     process.env.MOCK_REVIEW_RESPONSE = continueResponse;
     const output = await handleStop(context.input, "claude");
-    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.match(output.systemMessage, /continuation cap \(20\) reached/);
     assert.equal((await context.calls()).length, 0);
   } finally {
     await context.cleanup();
@@ -569,7 +569,7 @@ test("Codex stops unconditionally once the continuation cap is reached", { concu
     await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${feedback.join("\n")}\n`);
     process.env.MOCK_REVIEW_RESPONSE = continueResponse;
     const output = await handleStop(context.input);
-    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.match(output.systemMessage, /continuation cap \(20\) reached/);
     assert.equal((await context.calls()).length, 0);
   } finally {
     await context.cleanup();
@@ -600,7 +600,7 @@ test("verbose assistant passes cannot hide the Codex continuation cap", { concur
 
     process.env.MOCK_REVIEW_RESPONSE = continueResponse;
     const output = await handleStop(context.input);
-    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.match(output.systemMessage, /continuation cap \(20\) reached/);
     assert.equal((await context.calls()).length, 0);
   } finally {
     await context.cleanup();
@@ -707,7 +707,7 @@ test("Ghost stops unconditionally once the continuation cap is reached", { concu
     const transcript = await piTranscriptFixture(context, { continuations: CONTINUATION_CAP });
     process.env.MOCK_REVIEW_RESPONSE = continueResponse;
     const output = await handleStop({ ...context.input, conversation_runtime: "pi", transcript_path: transcript }, "ghost");
-    assert.match(output.systemMessage, /continuation cap \(10\) reached/);
+    assert.match(output.systemMessage, /continuation cap \(20\) reached/);
     assert.equal((await context.calls()).length, 0);
   } finally {
     await context.cleanup();

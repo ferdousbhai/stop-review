@@ -18,9 +18,8 @@ import * as z from "zod/mini";
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MODEL_OUTPUT_LIMIT = 2 * 1024 * 1024;
 const CLASSIFIER_TIMEOUT_MS = 180_000;
-// Continuations per user turn before the hook accepts the stop unconditionally.
-// Ghost enforces its own cap (GHOST_SESSION_STOP_CONTINUATION_CAP); this covers Claude Code and Codex.
-const CONTINUATION_CAP = 10;
+// Continuations per owner turn before the hook accepts the stop unconditionally.
+const CONTINUATION_CAP = 20;
 
 const RUNTIMES = {
   codex: {
