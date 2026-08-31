@@ -7,8 +7,8 @@ remains.
 
 You must implement an advisor sub-agent before installing Stop Review. Follow
 [Anthropic's advisor pattern](https://www.anthropic.com/webinars/building-on-the-claude-platform-claude-fable-5-and-model-orchestration-patterns).
-Stop Review can tell the current agent to consult the advisor, but it does not
-provide the advisor itself.
+Stop Review can tell the current agent to follow the advisor recommendation,
+but it does not provide the advisor itself.
 
 Stop Review permits at most 20 automatic continuations for one owner turn.
 After the cap is reached, it accepts the next stop without another review. A

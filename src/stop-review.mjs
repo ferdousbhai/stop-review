@@ -700,7 +700,7 @@ function parseReviewVerdict(text) {
 function hookOutputForVerdict(verdict) {
   if (verdict === "CONTINUE") return { decision: "block", reason: "Please continue." };
   if (verdict === "CONSULT") {
-    return { decision: "block", reason: "Please consult the advisor, then continue." };
+    return { decision: "block", reason: "Follow the advisor recommendation." };
   }
   return {};
 }

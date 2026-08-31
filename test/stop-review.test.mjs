@@ -412,7 +412,7 @@ test("CONSULT maps to the fixed advisor continuation", { concurrency: false }, a
     const output = await handleStop(context.input);
     assert.deepEqual(output, {
       decision: "block",
-      reason: "Please consult the advisor, then continue.",
+      reason: "Follow the advisor recommendation.",
     });
     assert.deepEqual((await context.calls()).map((item) => item.model), ["gpt-5.6-luna"]);
   } finally {
@@ -488,7 +488,7 @@ test("Ghost delegates classification to its smol-model bridge", { concurrency: f
     const output = await handleStop(context.input, "ghost");
     assert.deepEqual(output, {
       decision: "block",
-      reason: "Please consult the advisor, then continue.",
+      reason: "Follow the advisor recommendation.",
     });
     const [call] = await context.calls();
     assert.deepEqual(call.args, ["hook-smol-complete"]);
@@ -513,7 +513,7 @@ test("Zod accepts only the exact review verdict enum", () => {
   assert.deepEqual(hookOutputForVerdict("CONTINUE"), { decision: "block", reason: "Please continue." });
   assert.deepEqual(hookOutputForVerdict("CONSULT"), {
     decision: "block",
-    reason: "Please consult the advisor, then continue.",
+    reason: "Follow the advisor recommendation.",
   });
   assert.deepEqual(hookOutputForVerdict("STOP"), {});
 });
@@ -537,7 +537,7 @@ test("continuation cap counts only host-injected hook prompts", () => {
     "Stop hook feedback:\ncontinue",
     '<hook_prompt hook_run_id="stop:1:/x/hooks.json">continue</hook_prompt>',
     "please keep going",
-    "Stop hook feedback: please consult the advisor with these open questions, then continue:\n- q",
+    "Stop hook feedback: Follow the advisor recommendation.",
   ]), 3);
   assert.equal(countHookContinuations(undefined), 0);
 });
