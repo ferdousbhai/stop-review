@@ -7,7 +7,6 @@ import test from "node:test";
 import {
   CONTINUATION_CAP,
   REVIEW_PROMPT,
-  REVIEW_VERDICT_SCHEMA,
   countContinuations,
   handleStop,
   hookOutputForVerdict,
@@ -496,13 +495,11 @@ test("Ghost delegates classification to its smol-model bridge", { concurrency: f
   }
 });
 
-test("Zod accepts only the exact review verdict enum", () => {
+test("verdict parsing accepts only the exact review enum", () => {
   for (const verdict of ["CONTINUE", "CONSULT", "STOP"]) {
     assert.equal(parseReviewVerdict(` ${verdict}\n`), verdict);
-    assert.equal(REVIEW_VERDICT_SCHEMA.safeParse(verdict).success, true);
   }
-  for (const invalid of ["continue", "CONSULT_ADVISOR", "STOP now", "{}", ""]) {
-    assert.equal(REVIEW_VERDICT_SCHEMA.safeParse(invalid).success, false);
+  for (const invalid of ["continue", "CONSULT_ADVISOR", "STOP now", "{}", "", null, undefined]) {
     assert.throws(() => parseReviewVerdict(invalid), /exactly CONTINUE, CONSULT, or STOP/);
   }
   assert.deepEqual(hookOutputForVerdict("CONTINUE"), { decision: "block", reason: "Please continue." });
@@ -521,9 +518,9 @@ test("bundled plugin preserves the validated verdict protocol", () => {
   assert.equal(bundled.REVIEW_PROMPT, REVIEW_PROMPT);
 });
 
-test("bundled plugin keeps Zod Mini tree-shakeable", async () => {
+test("bundled plugin stays dependency-free and lean", async () => {
   const bundle = await stat(new URL("../plugins/stop-review/scripts/stop-review.mjs", import.meta.url));
-  assert.ok(bundle.size < 64 * 1024, `expected bundle below 64 KiB, received ${bundle.size} bytes`);
+  assert.ok(bundle.size < 16 * 1024, `expected bundle below 16 KiB, received ${bundle.size} bytes`);
 });
 
 test("Claude stops unconditionally once the continuation cap is reached", { concurrency: false }, async () => {

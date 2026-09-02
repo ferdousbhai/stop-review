@@ -7,7 +7,6 @@ import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import * as z from "zod/mini";
 
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MODEL_OUTPUT_LIMIT = 2 * 1024 * 1024;
@@ -29,7 +28,7 @@ const RUNTIMES = {
 
 // Validate the reviewer's tiny provider-independent protocol before translating
 // it to the host-specific Stop-hook JSON.
-const REVIEW_VERDICT_SCHEMA = z.enum(["CONTINUE", "CONSULT", "STOP"]);
+const REVIEW_VERDICTS = new Set(["CONTINUE", "CONSULT", "STOP"]);
 
 const REVIEW_PROMPT = `Classify last_assistant_message:
 
@@ -487,11 +486,11 @@ async function runReviewModel(options) {
 }
 
 function parseReviewVerdict(text) {
-  const parsed = REVIEW_VERDICT_SCHEMA.safeParse(String(text ?? "").trim());
-  if (!parsed.success) {
+  const verdict = String(text ?? "").trim();
+  if (!REVIEW_VERDICTS.has(verdict)) {
     throw new Error("Reviewer output must be exactly CONTINUE, CONSULT, or STOP");
   }
-  return parsed.data;
+  return verdict;
 }
 
 function hookOutputForVerdict(verdict) {
@@ -589,7 +588,6 @@ if (import.meta.url === entry) await main();
 export {
   CONTINUATION_CAP,
   REVIEW_PROMPT,
-  REVIEW_VERDICT_SCHEMA,
   countContinuations,
   handleStop,
   hookOutputForVerdict,
