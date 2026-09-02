@@ -1,13 +1,7 @@
 #!/usr/bin/env node
 
 import { createReadStream } from "node:fs";
-import {
-  appendFile,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-} from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -122,45 +116,6 @@ async function* jsonLines(file) {
   }
 }
 
-function boundMessages(messages, maxMessages, maxChars) {
-  const selected = [];
-  let chars = 0;
-  for (let index = messages.length - 1; index >= 0 && selected.length < maxMessages; index -= 1) {
-    const item = messages[index];
-    const text = compactText(item.text);
-    if (!text || (selected.length > 0 && chars + text.length > maxChars)) continue;
-    selected.push({ role: item.role, text });
-    chars += text.length;
-  }
-  selected.reverse();
-
-  const firstUser = messages.find((item) => item.role === "user");
-  if (firstUser) {
-    const firstUserText = compactText(firstUser.text);
-    if (!selected.some((item) => item.role === "user" && item.text === firstUserText)) {
-      selected.unshift({ role: "user", text: firstUserText });
-    }
-  }
-  return selected;
-}
-
-function transcriptSummary(previous, current, tools, assistantStopCandidate, initialFallback = null) {
-  const currentMessages = boundMessages(current, 30, 42_000);
-  const currentUserMessages = current.filter((item) => item.role === "user");
-  return {
-    recent_context: boundMessages(previous, 12, 24_000),
-    initial_user_request: currentUserMessages[0]
-      ? compactText(currentUserMessages[0].text)
-      : initialFallback,
-    continuation_prompts: currentUserMessages
-      .slice(1)
-      .map((item) => compactText(item.text)),
-    current_turn_messages: currentMessages,
-    tool_events: tools.slice(-50),
-    assistant_stop_candidate: compactText(assistantStopCandidate, 12_000),
-  };
-}
-
 function turnStartIndex(items, ownerPrompt, ownerText) {
   if (ownerPrompt) {
     const matchingOwner = items.findLastIndex((item) => ownerText(item)?.trim() === ownerPrompt);
@@ -169,49 +124,11 @@ function turnStartIndex(items, ownerPrompt, ownerText) {
   return items.findLastIndex((item) => ownerText(item) !== null);
 }
 
-function commandText(command) {
-  if (Array.isArray(command)) return command.join(" ");
-  if (typeof command === "string") return command;
-  return "";
-}
-
-function commandCategory(command) {
-  const value = commandText(command).toLowerCase();
-  if (/\b(test|pytest|vitest|jest|cargo test|go test|rspec)\b/.test(value)) return "test";
-  if (/\b(lint|eslint|ruff|clippy|shellcheck|typecheck|tsc)\b/.test(value)) return "lint";
-  if (/\b(build|compile|bundle)\b/.test(value)) return "build";
-  if (/\b(git|gh)\b/.test(value)) return "version-control";
-  if (/\b(rg|grep|find|jq|sed)\b/.test(value)) return "inspection";
-  return "other";
-}
-
-function summarizeToolItem(item) {
-  if (!item || typeof item !== "object") return null;
-  if (["Reasoning", "AgentMessage", "UserMessage"].includes(item.type)) return null;
-
-  if (item.type === "CommandExecution") {
-    return {
-      type: "command",
-      status: item.status ?? "unknown",
-      category: commandCategory(item.command),
-      ...(Number.isInteger(item.exit_code)
-        ? { exit_code: item.exit_code, outcome: item.exit_code === 0 ? "succeeded" : "failed" }
-        : {}),
-    };
-  }
-
-  if (item.type === "Extension") {
-    return {
-      type: item.kind ?? "extension",
-      status: item.status ?? "completed",
-    };
-  }
-
-  return {
-    type: item.type ?? "tool",
-    status: item.status ?? "completed",
-  };
-}
+// Prompts the host injected on behalf of this hook. Claude Code records them as
+// "Stop hook feedback: ..." meta user messages and Codex as <hook_prompt ...>
+// user messages; ghost's transcripts hold nothing but hook continuations
+// between owner prompts, so every one of them counts.
+const HOOK_PROMPT_PATTERN = /^\s*(?:Stop hook feedback\b|<hook_prompt\b)/;
 
 async function allowedTranscriptPath(transcriptPath, runner = "codex", roots) {
   if (typeof transcriptPath !== "string" || !transcriptPath) {
@@ -238,122 +155,58 @@ async function allowedTranscriptPath(transcriptPath, runner = "codex", roots) {
   throw new Error(`transcript_path is outside the ${runner} transcript directories`);
 }
 
-async function codexTranscriptEvidence(input) {
+async function codexContinuations(input) {
   const transcriptPath = await allowedTranscriptPath(input.transcript_path, "codex");
-  const current = [];
-  const previous = [];
-  const tools = [];
+  let count = 0;
   for await (const record of jsonLines(transcriptPath)) {
-    const turnId = recordTurnId(record);
     const payload = record?.payload;
-
     if (
       record?.type === "response_item" &&
       payload?.type === "message" &&
-      (payload.role === "user" || payload.role === "assistant")
+      payload.role === "user" &&
+      recordTurnId(record) === input.turn_id &&
+      HOOK_PROMPT_PATTERN.test(messageText(payload))
     ) {
-      const text = messageText(payload);
-      if (!text || isInjectedContext(text)) continue;
-      const destination = turnId === input.turn_id ? current : previous;
-      destination.push({ role: payload.role, text });
-      if (destination === previous && previous.length > 30) previous.shift();
-      continue;
-    }
-
-    if (turnId === input.turn_id && payload?.type === "item_completed") {
-      const summary = summarizeToolItem(payload.item);
-      if (summary) tools.push(summary);
+      count += 1;
     }
   }
-
-  return transcriptSummary(previous, current, tools, input.last_assistant_message ?? "");
+  return count;
 }
 
-function claudeMessage(record) {
-  const role = record?.message?.role;
-  if ((record?.type !== "user" && record?.type !== "assistant") || !["user", "assistant"].includes(role)) {
-    return null;
-  }
+function claudeUserMessage(record) {
+  if (record?.type !== "user" || record.message?.role !== "user") return null;
 
-  if (typeof record.message.content === "string") {
-    return {
-      role,
-      text: record.message.content,
-      genuineUser:
-        role === "user" &&
-        record.origin?.kind !== "task-notification" &&
-        record.promptSource !== "system" &&
-        record.isMeta !== true,
-    };
-  }
-  if (!Array.isArray(record.message.content)) return null;
-
-  const text = record.message.content
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("\n");
-  if (!text) return null;
+  const text = typeof record.message.content === "string"
+    ? record.message.content
+    : messageText(record.message);
+  if (!text || isInjectedContext(text)) return null;
   return {
-    role,
     text,
-    genuineUser:
-      role === "user" &&
+    genuine:
       record.origin?.kind !== "task-notification" &&
       record.promptSource !== "system" &&
       record.isMeta !== true,
   };
 }
 
-function claudeToolEvents(record) {
-  if (!Array.isArray(record?.message?.content)) return [];
-  const events = [];
-  for (const part of record.message.content) {
-    if (part?.type === "tool_use") {
-      events.push({ type: compactText(part.name ?? "tool", 120), status: "requested" });
-    } else if (part?.type === "tool_result") {
-      events.push({ type: "tool_result", status: part.is_error ? "failed" : "completed" });
-    }
-  }
-  return events;
-}
-
-function stopCandidateText(input) {
-  if (typeof input.last_assistant_message === "string") return input.last_assistant_message;
-  return messageText(input.last_assistant_message);
-}
-
-async function claudeTranscriptEvidence(input, options = {}) {
+async function claudeContinuations(input, options = {}) {
   const transcriptPath = options.transcriptPath ?? await allowedTranscriptPath(input.transcript_path, "claude");
-  const records = [];
-  for await (const record of jsonLines(transcriptPath)) records.push(record);
+  const messages = [];
+  for await (const record of jsonLines(transcriptPath)) {
+    const message = claudeUserMessage(record);
+    if (message) messages.push(message);
+  }
 
   // The current turn starts at the last genuine user message. A host that
   // re-prompts with plain user messages (ghost's Claude Code runtime) supplies
-  // the owner prompt so those continuations stay inside the turn.
+  // the owner prompt so those continuations stay inside the turn — and every
+  // user message after it counts as a continuation.
   const ownerPrompt = typeof options.ownerPrompt === "string" ? options.ownerPrompt.trim() : null;
-  const turnStart = turnStartIndex(records, ownerPrompt, (record) => {
-    const message = claudeMessage(record);
-    return message?.genuineUser ? message.text : null;
-  });
-
-  const previous = [];
-  const current = [];
-  const tools = [];
-  records.forEach((record, index) => {
-    const message = claudeMessage(record);
-    if (message && !isInjectedContext(message.text)) {
-      (index >= turnStart && turnStart >= 0 ? current : previous).push(message);
-    }
-    if (index >= turnStart && turnStart >= 0) tools.push(...claudeToolEvents(record));
-  });
-
-  return {
-    ...transcriptSummary(previous, current, tools, stopCandidateText(input)),
-    background_activity: {
-      tasks: Array.isArray(input.background_tasks) ? input.background_tasks.length : 0,
-      scheduled_jobs: Array.isArray(input.session_crons) ? input.session_crons.length : 0,
-    },
-  };
+  const turnStart = turnStartIndex(messages, ownerPrompt, (item) => (item.genuine ? item.text : null));
+  if (turnStart < 0) return 0;
+  const inTurn = messages.slice(turnStart + 1);
+  if (ownerPrompt) return inTurn.length;
+  return inTurn.filter((item) => HOOK_PROMPT_PATTERN.test(item.text)).length;
 }
 
 // Pi session files are trees: every entry carries id/parentId and the live
@@ -376,114 +229,58 @@ function piActiveBranch(records) {
   return branch.reverse();
 }
 
-async function piTranscriptEvidence(input, transcriptPath) {
+async function piContinuations(input, transcriptPath) {
   const records = [];
   for await (const record of jsonLines(transcriptPath)) records.push(record);
 
-  // One timeline of owner prompts, hook continuations, assistant passes and tool events.
-  const timeline = [];
+  // One timeline of owner prompts and hook continuations; everything after the
+  // owner prompt that starts the current turn is a continuation.
+  const prompts = [];
   for (const entry of piActiveBranch(records)) {
-    if (entry?.type === "message" && entry.message && typeof entry.message === "object") {
-      const message = entry.message;
-      if (message.role === "user") {
-        const text = messageText(message);
-        if (text) timeline.push({ kind: "message", role: "user", text, owner: true });
-      } else if (message.role === "assistant") {
-        const text = messageText(message);
-        if (text) timeline.push({ kind: "message", role: "assistant", text });
-        for (const part of Array.isArray(message.content) ? message.content : []) {
-          if (part?.type === "toolCall") {
-            timeline.push({ kind: "tool", event: { type: compactText(part.name ?? "tool", 120), status: "requested" } });
-          }
-        }
-      } else if (message.role === "toolResult") {
-        timeline.push({ kind: "tool", event: { type: "tool_result", status: message.isError ? "failed" : "completed" } });
-      }
+    if (entry?.type === "message" && entry.message?.role === "user") {
+      const text = messageText(entry.message);
+      if (text) prompts.push({ owner: true, text });
     } else if (
       entry?.type === "custom_message" &&
       entry.customType === "session-stop-continuation" &&
       typeof entry.content === "string" &&
       entry.content
     ) {
-      timeline.push({ kind: "message", role: "user", text: entry.content, owner: false });
+      prompts.push({ owner: false, text: entry.content });
     }
   }
 
   const ownerPrompt = typeof input.owner_prompt === "string" ? input.owner_prompt.trim() : "";
-  const turnStart = turnStartIndex(
-    timeline,
-    ownerPrompt,
-    (item) => item.kind === "message" && item.owner ? item.text : null,
-  );
-
-  const previous = [];
-  const current = [];
-  const tools = [];
-  timeline.forEach((item, index) => {
-    const inTurn = turnStart >= 0 && index >= turnStart;
-    if (item.kind === "message") (inTurn ? current : previous).push({ role: item.role, text: item.text });
-    else if (inTurn) tools.push(item.event);
-  });
-
-  return {
-    ...transcriptSummary(previous, current, tools, stopCandidateText(input), ownerPrompt || null),
-    ghost_runtime: input.runtime ?? null,
-  };
-}
-
-function ghostAssistantText(input) {
-  const direct = messageText(input.last_assistant_message);
-  if (direct) return direct;
-  if (!Array.isArray(input.messages)) return "";
-  return input.messages
-    .filter((message) => message?.role === "assistant")
-    .map((message) => messageText(message))
-    .filter(Boolean)
-    .join("\n");
-}
-
-function ghostPayloadEvidence(input) {
-  const ownerPrompt = compactText(input.owner_prompt ?? "", 24_000);
-  if (!ownerPrompt) throw new Error("Ghost stop input is missing owner_prompt");
-  const assistant = compactText(ghostAssistantText(input), 12_000);
-  return {
-    recent_context: [],
-    initial_user_request: ownerPrompt,
-    continuation_prompts: [],
-    current_turn_messages: [
-      { role: "user", text: ownerPrompt },
-      ...(assistant ? [{ role: "assistant", text: assistant }] : []),
-    ],
-    tool_events: [],
-    assistant_stop_candidate: assistant,
-    ghost_runtime: input.runtime ?? null,
-  };
+  const turnStart = turnStartIndex(prompts, ownerPrompt, (item) => (item.owner ? item.text : null));
+  if (turnStart < 0) return 0;
+  return prompts.length - turnStart - 1;
 }
 
 // Ghost hands over its runtime's native transcript when one exists: the Pi
 // session file (OMP conversations) or the Claude Code SDK session file
 // (Claude Code conversations). Without one, only the current pass is known.
-async function ghostTranscriptEvidence(input) {
+async function ghostContinuations(input) {
   if (typeof input.owner_prompt !== "string" || !input.owner_prompt.trim()) {
     throw new Error("Ghost stop input is missing owner_prompt");
   }
-  if (typeof input.transcript_path !== "string" || !input.transcript_path) {
-    return ghostPayloadEvidence(input);
-  }
+  if (typeof input.transcript_path !== "string" || !input.transcript_path) return 0;
   if (input.conversation_runtime === "claude-code") {
     const transcriptPath = await allowedTranscriptPath(input.transcript_path, "claude");
-    const evidence = await claudeTranscriptEvidence(input, { transcriptPath, ownerPrompt: input.owner_prompt });
-    delete evidence.background_activity;
-    return { ...evidence, ghost_runtime: input.runtime ?? null };
+    return claudeContinuations(input, { transcriptPath, ownerPrompt: input.owner_prompt });
   }
   const transcriptPath = await allowedTranscriptPath(input.transcript_path, "ghost", [input.ghost_home]);
-  return piTranscriptEvidence(input, transcriptPath);
+  return piContinuations(input, transcriptPath);
 }
 
-async function transcriptEvidence(input, runner = "codex") {
-  if (runner === "claude") return claudeTranscriptEvidence(input);
-  if (runner === "ghost") return ghostTranscriptEvidence(input);
-  return codexTranscriptEvidence(input);
+async function countContinuations(input, runner = "codex") {
+  if (runner === "claude") return claudeContinuations(input);
+  if (runner === "ghost") return ghostContinuations(input);
+  return codexContinuations(input);
+}
+
+function stopCandidateText(input) {
+  if (typeof input.last_assistant_message === "string") return input.last_assistant_message;
+  return messageText(input.last_assistant_message);
 }
 
 async function readStdin() {
@@ -705,18 +502,6 @@ function hookOutputForVerdict(verdict) {
   return {};
 }
 
-// Prompts the host injected on behalf of this hook. Claude Code records them as
-// "Stop hook feedback: ..." meta user messages and Codex as <hook_prompt ...>
-// user messages; ghost's transcripts hold nothing but hook continuations
-// between owner prompts, so every one of them counts.
-function countHookContinuations(prompts, runner = "codex") {
-  if (!Array.isArray(prompts)) return 0;
-  if (runner === "ghost") return prompts.length;
-  return prompts.filter((text) =>
-    typeof text === "string" && /^\s*(?:Stop hook feedback\b|<hook_prompt\b)/.test(text),
-  ).length;
-}
-
 async function recordReviewAudit(input, runner, verdict, error) {
   const auditPath = process.env.STOP_REVIEW_AUDIT_LOG;
   if (!auditPath) return;
@@ -755,8 +540,7 @@ async function handleStop(input, runner = "codex") {
     // The transcript is used only to enforce the continuation cap. Its content
     // is never supplied to the reviewer.
     if (typeof input.transcript_path === "string" && input.transcript_path) {
-      const evidence = await transcriptEvidence(input, runner);
-      const continuations = countHookContinuations(evidence.continuation_prompts, runner);
+      const continuations = await countContinuations(input, runner);
       if (continuations >= CONTINUATION_CAP) {
         return {
           systemMessage: `Stop review: continuation cap (${CONTINUATION_CAP}) reached for this turn; accepting the stop.`,
@@ -806,11 +590,10 @@ export {
   CONTINUATION_CAP,
   REVIEW_PROMPT,
   REVIEW_VERDICT_SCHEMA,
-  countHookContinuations,
+  countContinuations,
   handleStop,
   hookOutputForVerdict,
   parseReviewVerdict,
   runClaudeModel,
   runCodexModel,
-  transcriptEvidence,
 };

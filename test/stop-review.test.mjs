@@ -8,11 +8,10 @@ import {
   CONTINUATION_CAP,
   REVIEW_PROMPT,
   REVIEW_VERDICT_SCHEMA,
-  countHookContinuations,
+  countContinuations,
   handleStop,
   hookOutputForVerdict,
   parseReviewVerdict,
-  transcriptEvidence,
 } from "../src/stop-review.mjs";
 import * as bundled from "../plugins/stop-review/scripts/stop-review.mjs";
 
@@ -317,41 +316,29 @@ process.stdout.write(JSON.stringify({ text: process.env.MOCK_REVIEW_RESPONSE }))
   };
 }
 
-test("transcript evidence redacts secrets and omits tool payloads", { concurrency: false }, async () => {
+test("Codex counting includes only hook prompts in the current turn", { concurrency: false }, async () => {
   const context = await fixture();
   try {
-    const evidence = await transcriptEvidence(context.input);
-    const serialized = JSON.stringify(evidence);
-    assert.doesNotMatch(serialized, /supersecretvalue/);
-    assert.doesNotMatch(serialized, /recommended_plugins/);
-    assert.equal(evidence.initial_user_request, "Build it now. token=[REDACTED]");
-    assert.deepEqual(evidence.tool_events, [
-      { type: "command", status: "completed", category: "test", exit_code: 0, outcome: "succeeded" },
-    ]);
-  } finally {
-    await context.cleanup();
-  }
-});
+    assert.equal(await countContinuations(context.input), 0);
 
-test("transcript evidence retains the initial user message when an assistant repeats it", { concurrency: false }, async () => {
-  const context = await fixture();
-  try {
-    const repeated = "Build it now. token=supersecretvalue";
-    const assistantMessages = Array.from({ length: 31 }, (_, index) =>
+    const additions = [
       transcriptLine({
-        role: "assistant",
-        content: [{ type: "output_text", text: index === 30 ? repeated : `Pass ${index}.` }],
-      }, context.input.turn_id)
-    );
+        role: "user",
+        content: [{ type: "input_text", text: '<hook_prompt hook_run_id="stop:1:/x">continue</hook_prompt>' }],
+      }, context.input.turn_id),
+      transcriptLine({
+        role: "user",
+        content: [{ type: "input_text", text: '<hook_prompt hook_run_id="stop:1:/x">continue</hook_prompt>' }],
+      }, "previous-turn"),
+      transcriptLine({
+        role: "user",
+        content: [{ type: "input_text", text: "please keep going" }],
+      }, context.input.turn_id),
+    ];
     const existing = await readFile(context.input.transcript_path, "utf8");
-    await writeFile(context.input.transcript_path, `${existing}\n${assistantMessages.join("\n")}\n`);
+    await writeFile(context.input.transcript_path, `${existing}\n${additions.join("\n")}\n`);
 
-    const evidence = await transcriptEvidence(context.input);
-    assert.equal(evidence.initial_user_request, "Build it now. token=[REDACTED]");
-    assert.deepEqual(evidence.current_turn_messages[0], {
-      role: "user",
-      text: "Build it now. token=[REDACTED]",
-    });
+    assert.equal(await countContinuations(context.input), 1);
   } finally {
     await context.cleanup();
   }
@@ -442,17 +429,25 @@ test("invalid reviewer verdict fails open", { concurrency: false }, async () => 
   }
 });
 
-test("Claude transcript evidence omits tool inputs and results", { concurrency: false }, async () => {
+test("Claude counting starts at the last genuine prompt and counts only hook feedback", { concurrency: false }, async () => {
   const context = await claudeFixture();
   try {
-    const evidence = await transcriptEvidence(context.input, "claude");
-    const serialized = JSON.stringify(evidence);
-    assert.doesNotMatch(serialized, /supersecretvalue/);
-    assert.equal(evidence.initial_user_request, "Build it now. token=[REDACTED]");
-    assert.deepEqual(evidence.tool_events, [
-      { type: "Bash", status: "requested" },
-      { type: "tool_result", status: "completed" },
-    ]);
+    assert.equal(await countContinuations(context.input, "claude"), 0);
+
+    const additions = [
+      JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "Stop hook feedback:\ncontinue" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "Do one more thing." }, origin: { kind: "human" } }),
+      JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "Stop hook feedback:\ncontinue" } }),
+      JSON.stringify({
+        type: "user",
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: "Background task finished." },
+      }),
+    ];
+    const existing = await readFile(context.input.transcript_path, "utf8");
+    await writeFile(context.input.transcript_path, `${existing.trimEnd()}\n${additions.join("\n")}\n`);
+
+    assert.equal(await countContinuations(context.input, "claude"), 1);
   } finally {
     await context.cleanup();
   }
@@ -531,20 +526,10 @@ test("bundled plugin keeps Zod Mini tree-shakeable", async () => {
   assert.ok(bundle.size < 64 * 1024, `expected bundle below 64 KiB, received ${bundle.size} bytes`);
 });
 
-test("continuation cap counts only host-injected hook prompts", () => {
-  assert.equal(CONTINUATION_CAP, 20);
-  assert.equal(countHookContinuations([
-    "Stop hook feedback:\ncontinue",
-    '<hook_prompt hook_run_id="stop:1:/x/hooks.json">continue</hook_prompt>',
-    "please keep going",
-    "Stop hook feedback: Follow the advisor recommendation.",
-  ]), 3);
-  assert.equal(countHookContinuations(undefined), 0);
-});
-
 test("Claude stops unconditionally once the continuation cap is reached", { concurrency: false }, async () => {
   const context = await claudeFixture();
   try {
+    assert.equal(CONTINUATION_CAP, 20);
     const feedback = Array.from({ length: CONTINUATION_CAP }, () =>
       JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "Stop hook feedback:\ncontinue" } })
     );
@@ -641,7 +626,7 @@ async function piTranscriptFixture(context, { continuations = 1 } = {}) {
   return transcript;
 }
 
-test("Ghost reviews the whole owner turn from its Pi transcript", { concurrency: false }, async () => {
+test("Ghost counts the current owner turn from its Pi transcript", { concurrency: false }, async () => {
   const context = await ghostFixture();
   try {
     const transcript = await piTranscriptFixture(context);
@@ -651,34 +636,17 @@ test("Ghost reviews the whole owner turn from its Pi transcript", { concurrency:
       transcript_path: transcript,
       last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Pass 2." }] },
     };
-    const evidence = await transcriptEvidence(input, "ghost");
-    assert.equal(evidence.initial_user_request, context.input.owner_prompt);
-    assert.deepEqual(evidence.continuation_prompts, ["continue"]);
-    assert.deepEqual(evidence.recent_context, [
-      { role: "user", text: "Earlier owner prompt." },
-      { role: "assistant", text: "Earlier answer." },
-    ]);
-    assert.deepEqual(evidence.current_turn_messages.map((item) => item.text), [
-      context.input.owner_prompt,
-      "First pass.",
-      "continue",
-      "Pass 2.",
-    ]);
-    assert.deepEqual(evidence.tool_events, [
-      { type: "read", status: "requested" },
-      { type: "tool_result", status: "completed" },
-    ]);
-    assert.equal(evidence.assistant_stop_candidate, "Pass 2.");
-    assert.equal(evidence.ghost_runtime, "omp");
-    const serialized = JSON.stringify(evidence);
-    assert.doesNotMatch(serialized, /supersecretvalue|Abandoned branch|private|\/etc\/passwd/);
+    assert.equal(await countContinuations(input, "ghost"), 1);
 
     process.env.MOCK_REVIEW_RESPONSE = continueResponse;
     const output = await handleStop(input, "ghost");
     assert.deepEqual(output, { decision: "block", reason: "Please continue." });
     const [call] = await context.calls();
     assert.match(call.input.prompt, /"last_assistant_message":"Pass 2\."/);
-    assert.doesNotMatch(call.input.prompt, /Earlier owner prompt|continuation_prompts|First pass/);
+    assert.doesNotMatch(
+      call.input.prompt,
+      /Earlier owner prompt|First pass|supersecretvalue|Abandoned branch|private|\/etc\/passwd/,
+    );
   } finally {
     await context.cleanup();
   }
@@ -693,9 +661,11 @@ test("Ghost rejects a transcript outside the ghost home and falls back without o
     assert.match(output.systemMessage, /outside the ghost transcript directories/);
     assert.equal((await context.calls()).length, 0);
 
-    const evidence = await transcriptEvidence(context.input, "ghost");
-    assert.deepEqual(evidence.continuation_prompts, []);
-    assert.equal(evidence.initial_user_request, context.input.owner_prompt);
+    assert.equal(await countContinuations(context.input, "ghost"), 0);
+    await assert.rejects(
+      countContinuations({ ...context.input, owner_prompt: " " }, "ghost"),
+      /missing owner_prompt/,
+    );
   } finally {
     await context.cleanup();
   }
@@ -732,19 +702,13 @@ test("Ghost's Claude Code runtime anchors the turn on the owner prompt", { concu
       JSON.stringify({ type: "user", message: { role: "user", content: "continue" } }),
       JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Second pass." }] } }),
     ].join("\n"));
-    const evidence = await transcriptEvidence({
+    assert.equal(await countContinuations({
       ...context.input,
       runtime: "claude-code",
       conversation_runtime: "claude-code",
       transcript_path: transcript,
       last_assistant_message: { role: "assistant", content: [{ type: "text", text: "Second pass." }] },
-    }, "ghost");
-    assert.equal(evidence.initial_user_request, context.input.owner_prompt);
-    assert.deepEqual(evidence.continuation_prompts, ["continue"]);
-    assert.deepEqual(evidence.recent_context.map((item) => item.text), ["Older prompt.", "Older answer."]);
-    assert.equal(evidence.assistant_stop_candidate, "Second pass.");
-    assert.equal(evidence.ghost_runtime, "claude-code");
-    assert.equal(evidence.background_activity, undefined);
+    }, "ghost"), 1);
   } finally {
     if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
